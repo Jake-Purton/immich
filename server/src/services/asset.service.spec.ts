@@ -1,5 +1,7 @@
 import { BadRequestException } from '@nestjs/common';
 import { DateTime } from 'luxon';
+import { CipherGCM, DecipherGCM } from 'node:crypto';
+import { PassThrough, Readable, Writable } from 'node:stream';
 import { AssetJobName, AssetStatsResponseDto } from 'src/dtos/asset.dto';
 import { AssetEditAction } from 'src/dtos/editing.dto';
 import { AssetFileType, AssetMetadataKey, AssetStatus, AssetType, AssetVisibility, JobName, JobStatus } from 'src/enum';
@@ -457,6 +459,169 @@ describe(AssetService.name, () => {
       });
       expect(mocks.asset.updateDateTimeOriginal).toHaveBeenCalledWith(['asset-1'], dateTimeRelative, timeZone);
       expect(mocks.job.queueAll).toHaveBeenCalledWith([{ name: JobName.SidecarWrite, data: { id: 'asset-1' } }]);
+    });
+
+    describe('locked folder encryption', () => {
+      it('should encrypt the original file when locking an asset with a DEK available', async () => {
+        const asset = AssetFactory.create({ originalPath: '/data/library/photo.jpg', encryptionNonce: null });
+        const auth = AuthFactory.from().session({ rawToken: 'raw-token' }).build();
+
+        mocks.access.asset.checkOwnerAccess.mockResolvedValue(new Set([asset.id]));
+        mocks.asset.getByIds.mockResolvedValue([asset]);
+        mocks.assetFile.search.mockResolvedValue([]);
+        mocks.session.get.mockResolvedValue({
+          id: auth.session!.id,
+          expiresAt: null,
+          pinExpiresAt: null,
+          oauthBearerToken: null,
+          wrappedDek: 'wrapped-session-dek',
+          dekNonce: 'session-dek-nonce',
+        });
+
+        const cipher = new PassThrough() as unknown as CipherGCM;
+        cipher.getAuthTag = () => Buffer.from('auth-tag', 'utf8');
+        mocks.crypto.createEncryptStream.mockReturnValue({ nonce: Buffer.from('nonce', 'utf8'), cipher });
+        mocks.storage.createPlainReadStream.mockReturnValue(Readable.from([Buffer.from('plaintext')]));
+        mocks.storage.createWriteStream.mockReturnValue(
+          new Writable({
+            write(_chunk, _encoding, callback) {
+              callback();
+            },
+          }),
+        );
+
+        await sut.updateAll(auth, { ids: [asset.id], visibility: AssetVisibility.Locked });
+
+        expect(mocks.session.get).toHaveBeenCalledWith(auth.session!.id, { withDek: true });
+        expect(mocks.crypto.deriveSessionKek).toHaveBeenCalledWith('raw-token');
+        expect(mocks.crypto.unwrapDek).toHaveBeenCalledWith(
+          Buffer.from('wrapped-session-dek', 'base64'),
+          Buffer.from('session-dek-nonce', 'base64'),
+          Buffer.from('session-kek', 'utf8'),
+        );
+        expect(mocks.storage.rename).toHaveBeenCalledWith(`${asset.originalPath}.encrypting`, asset.originalPath);
+        expect(mocks.asset.update).toHaveBeenCalledWith({
+          id: asset.id,
+          encryptionNonce: Buffer.from('nonce', 'utf8').toString('base64'),
+          encryptionAuthTag: Buffer.from('auth-tag', 'utf8').toString('base64'),
+        });
+      });
+
+      it('should not encrypt or block locking when the session has no DEK available', async () => {
+        const asset = AssetFactory.create({ originalPath: '/data/library/photo.jpg', encryptionNonce: null });
+        const auth = AuthFactory.create();
+
+        mocks.access.asset.checkOwnerAccess.mockResolvedValue(new Set([asset.id]));
+        mocks.asset.getByIds.mockResolvedValue([asset]);
+
+        await sut.updateAll(auth, { ids: [asset.id], visibility: AssetVisibility.Locked });
+
+        expect(mocks.storage.createPlainReadStream).not.toHaveBeenCalled();
+        expect(mocks.asset.update).not.toHaveBeenCalled();
+      });
+
+      it('should skip assets that are already encrypted', async () => {
+        const asset = AssetFactory.create({
+          originalPath: '/data/library/photo.jpg',
+          encryptionNonce: 'already-encrypted-nonce',
+        });
+        const auth = AuthFactory.from().session({ rawToken: 'raw-token' }).build();
+
+        mocks.access.asset.checkOwnerAccess.mockResolvedValue(new Set([asset.id]));
+        mocks.asset.getByIds.mockResolvedValue([asset]);
+        mocks.session.get.mockResolvedValue({
+          id: auth.session!.id,
+          expiresAt: null,
+          pinExpiresAt: null,
+          oauthBearerToken: null,
+          wrappedDek: 'wrapped-session-dek',
+          dekNonce: 'session-dek-nonce',
+        });
+
+        await sut.updateAll(auth, { ids: [asset.id], visibility: AssetVisibility.Locked });
+
+        expect(mocks.storage.createPlainReadStream).not.toHaveBeenCalled();
+        expect(mocks.asset.update).not.toHaveBeenCalled();
+      });
+    });
+
+    describe('locked folder decryption', () => {
+      it('should decrypt the original file when unlocking a previously-encrypted asset with a DEK available', async () => {
+        const asset = AssetFactory.create({
+          originalPath: '/data/library/photo.jpg',
+          encryptionNonce: 'nonce',
+          encryptionAuthTag: 'auth-tag',
+        });
+        const auth = AuthFactory.from().session({ rawToken: 'raw-token' }).build();
+
+        mocks.access.asset.checkOwnerAccess.mockResolvedValue(new Set([asset.id]));
+        mocks.asset.getByIds.mockResolvedValue([asset]);
+        mocks.assetFile.search.mockResolvedValue([]);
+        mocks.session.get.mockResolvedValue({
+          id: auth.session!.id,
+          expiresAt: null,
+          pinExpiresAt: null,
+          oauthBearerToken: null,
+          wrappedDek: 'wrapped-session-dek',
+          dekNonce: 'session-dek-nonce',
+        });
+
+        const decipher = new PassThrough() as unknown as DecipherGCM;
+        mocks.crypto.createDecryptStream.mockReturnValue(decipher);
+        mocks.storage.createPlainReadStream.mockReturnValue(Readable.from([Buffer.from('ciphertext')]));
+        mocks.storage.createWriteStream.mockReturnValue(
+          new Writable({
+            write(_chunk, _encoding, callback) {
+              callback();
+            },
+          }),
+        );
+
+        await sut.updateAll(auth, { ids: [asset.id], visibility: AssetVisibility.Timeline });
+
+        expect(mocks.crypto.createDecryptStream).toHaveBeenCalledWith(
+          Buffer.from('dek', 'utf8'),
+          Buffer.from('nonce', 'base64'),
+          Buffer.from('auth-tag', 'base64'),
+        );
+        expect(mocks.storage.rename).toHaveBeenCalledWith(`${asset.originalPath}.decrypting`, asset.originalPath);
+        expect(mocks.asset.update).toHaveBeenCalledWith({
+          id: asset.id,
+          encryptionNonce: null,
+          encryptionAuthTag: null,
+        });
+      });
+
+      it('should not decrypt or block unlocking when the session has no DEK available', async () => {
+        const asset = AssetFactory.create({
+          originalPath: '/data/library/photo.jpg',
+          encryptionNonce: 'nonce',
+          encryptionAuthTag: 'auth-tag',
+        });
+        const auth = AuthFactory.create();
+
+        mocks.access.asset.checkOwnerAccess.mockResolvedValue(new Set([asset.id]));
+        mocks.asset.getByIds.mockResolvedValue([asset]);
+
+        await sut.updateAll(auth, { ids: [asset.id], visibility: AssetVisibility.Timeline });
+
+        expect(mocks.storage.createPlainReadStream).not.toHaveBeenCalled();
+        expect(mocks.asset.update).not.toHaveBeenCalled();
+      });
+
+      it('should skip assets that are not currently encrypted', async () => {
+        const asset = AssetFactory.create({ originalPath: '/data/library/photo.jpg', encryptionNonce: null });
+        const auth = AuthFactory.from().session({ rawToken: 'raw-token' }).build();
+
+        mocks.access.asset.checkOwnerAccess.mockResolvedValue(new Set([asset.id]));
+        mocks.asset.getByIds.mockResolvedValue([asset]);
+
+        await sut.updateAll(auth, { ids: [asset.id], visibility: AssetVisibility.Timeline });
+
+        expect(mocks.session.get).not.toHaveBeenCalled();
+        expect(mocks.storage.createPlainReadStream).not.toHaveBeenCalled();
+        expect(mocks.asset.update).not.toHaveBeenCalled();
+      });
     });
   });
 

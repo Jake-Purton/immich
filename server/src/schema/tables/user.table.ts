@@ -36,6 +36,15 @@ export class UserTable {
   @Column({ nullable: true, default: null })
   password!: string | null;
 
+  @Column({ nullable: true, default: null })
+  wrappedDek!: string | null;
+
+  @Column({ nullable: true, default: null })
+  kekSalt!: string | null;
+
+  @Column({ nullable: true, default: null })
+  kekNonce!: string | null;
+
   @Column({ nullable: true })
   pinCode!: string | null;
 

@@ -1,4 +1,10 @@
-import { BadRequestException, Injectable, InternalServerErrorException, NotFoundException } from '@nestjs/common';
+import {
+  BadRequestException,
+  ForbiddenException,
+  Injectable,
+  InternalServerErrorException,
+  NotFoundException,
+} from '@nestjs/common';
 import sanitize from 'sanitize-filename';
 import { StorageCore } from 'src/cores/storage.core';
 import { Asset, AuthSharedLink } from 'src/database';
@@ -233,18 +239,34 @@ export class AssetMediaService extends BaseService {
       dto.edited = true;
     }
 
-    const { originalPath, originalFileName, editedPath } = await this.assetRepository.getForOriginal(
-      id,
-      dto.edited ?? false,
-    );
+    const { originalPath, originalFileName, editedPath, encryptionNonce, encryptionAuthTag } =
+      await this.assetRepository.getForOriginal(id, dto.edited ?? false);
 
     const path = editedPath ?? originalPath!;
+
+    // Only the original file (not the derivative edited file) is ever encrypted at rest by the Locked Folder
+    // feature — see `AssetService.encryptLockedAssets`.
+    let decrypt: ImmichFileResponse['decrypt'];
+    if (!editedPath && encryptionNonce && encryptionAuthTag) {
+      const dek = await this.resolveSessionDek(auth);
+      if (!dek) {
+        throw new ForbiddenException('This asset is encrypted at rest and cannot be decrypted for this session');
+      }
+
+      const decipher = this.cryptoRepository.createDecryptStream(
+        dek,
+        Buffer.from(encryptionNonce, 'base64'),
+        Buffer.from(encryptionAuthTag, 'base64'),
+      );
+      decrypt = (cipherStream) => cipherStream.pipe(decipher);
+    }
 
     return new ImmichFileResponse({
       path,
       fileName: getFileNameWithoutExtension(originalFileName) + getFilenameExtension(path),
       contentType: mimeTypes.lookup(path),
       cacheControl: CacheControl.PrivateWithCache,
+      decrypt,
     });
   }
 
@@ -264,11 +286,8 @@ export class AssetMediaService extends BaseService {
     }
 
     const size = (dto.size ?? AssetMediaSize.THUMBNAIL) as unknown as AssetFileType;
-    const { originalPath, originalFileName, path } = await this.assetRepository.getForThumbnail(
-      id,
-      size,
-      dto.edited ?? false,
-    );
+    const { originalPath, originalFileName, path, encryptionNonce, encryptionAuthTag } =
+      await this.assetRepository.getForThumbnail(id, size, dto.edited ?? false);
 
     if (size === AssetFileType.FullSize && mimeTypes.isWebSupportedImage(originalPath) && !dto.edited) {
       // use original file for web supported images
@@ -289,11 +308,29 @@ export class AssetMediaService extends BaseService {
       auth.sharedLink && !auth.sharedLink.showExif ? id : getFileNameWithoutExtension(originalFileName);
     const fileName = `${fileNameBase}_${size}${getFilenameExtension(path)}`;
 
+    // Thumbnail/preview/fullsize derivative files are encrypted at rest alongside the original — see
+    // `AssetService.encryptLockedAssets`.
+    let decrypt: ImmichFileResponse['decrypt'];
+    if (encryptionNonce && encryptionAuthTag) {
+      const dek = await this.resolveSessionDek(auth);
+      if (!dek) {
+        throw new ForbiddenException('This asset is encrypted at rest and cannot be decrypted for this session');
+      }
+
+      const decipher = this.cryptoRepository.createDecryptStream(
+        dek,
+        Buffer.from(encryptionNonce, 'base64'),
+        Buffer.from(encryptionAuthTag, 'base64'),
+      );
+      decrypt = (cipherStream) => cipherStream.pipe(decipher);
+    }
+
     return new ImmichFileResponse({
       fileName,
       path,
       contentType: mimeTypes.lookup(path),
       cacheControl: CacheControl.PrivateWithCache,
+      decrypt,
     });
   }
 
@@ -306,12 +343,35 @@ export class AssetMediaService extends BaseService {
       throw new NotFoundException('Asset not found or asset is not a video');
     }
 
+    const usingEncodedVideo = !!asset.encodedVideoPath;
     const filepath = asset.encodedVideoPath || asset.originalPath;
+    const encryptionNonce = usingEncodedVideo ? asset.encodedVideoEncryptionNonce : asset.originalEncryptionNonce;
+    const encryptionAuthTag = usingEncodedVideo ? asset.encodedVideoEncryptionAuthTag : asset.originalEncryptionAuthTag;
+
+    // The encoded video (or, if none exists, the original) may be encrypted at rest by the Locked Folder feature —
+    // see `AssetService.encryptLockedAssets`. Range requests are not supported when decrypting, since the
+    // underlying cipher stream can only be consumed from the beginning — see the design doc's known-limitations
+    // section on scrubbable video playback.
+    let decrypt: ImmichFileResponse['decrypt'];
+    if (encryptionNonce && encryptionAuthTag) {
+      const dek = await this.resolveSessionDek(auth);
+      if (!dek) {
+        throw new ForbiddenException('This asset is encrypted at rest and cannot be decrypted for this session');
+      }
+
+      const decipher = this.cryptoRepository.createDecryptStream(
+        dek,
+        Buffer.from(encryptionNonce, 'base64'),
+        Buffer.from(encryptionAuthTag, 'base64'),
+      );
+      decrypt = (cipherStream) => cipherStream.pipe(decipher);
+    }
 
     return new ImmichFileResponse({
       path: filepath,
       contentType: mimeTypes.lookup(filepath),
       cacheControl: CacheControl.PrivateWithCache,
+      decrypt,
     });
   }
 

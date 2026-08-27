@@ -72,7 +72,69 @@ export class AuthService extends BaseService {
       throw new UnauthorizedException('Incorrect email or password');
     }
 
-    return this.createLoginResponse(user, details);
+    let dek: Buffer | undefined;
+    if (user.wrappedDek) {
+      this.logger.debug(`[DEK] User ${user.id} already has a wrapped DEK, attempting to unwrap with login password`);
+      try {
+        dek = this.unwrapUserDek(user, dto.password);
+        this.logger.debug(`[DEK] Successfully unwrapped existing DEK for user ${user.id} (length=${dek.length})`);
+      } catch (error) {
+        // Should not normally happen (it would mean the wrapped DEK is corrupted, or was wrapped with a
+        // password that no longer matches this one). Login must stay available either way — the user simply
+        // won't get session-level Locked Folder decryption access for this session.
+        this.logger.error(`[DEK] Failed to unwrap DEK for user ${user.id}, proceeding without one: ${error}`);
+      }
+    } else {
+      this.logger.debug(`[DEK] User ${user.id} has no wrapped DEK yet, generating a new one`);
+      dek = await this.generateUserDek(user.id, dto.password);
+    }
+
+    this.logger.debug(
+      `[DEK] Login for user ${user.id} completed with dek=${dek ? `present (length=${dek.length})` : 'MISSING'}`,
+    );
+
+    return this.createLoginResponse(user, details, { dek });
+  }
+
+  /**
+   * Generates a new DEK for the user, wraps it with a KEK derived from their password, and
+   * persists the wrapped DEK, KEK salt, and nonce. Only run once, the first time a user does
+   * not yet have a DEK (e.g. their first login after this feature was introduced). Returns the
+   * plaintext DEK so the caller can also make it available to the new login session.
+   */
+  private async generateUserDek(userId: string, password: string): Promise<Buffer> {
+    const dek = this.cryptoRepository.generateDek();
+    const kekSalt = this.cryptoRepository.generateKekSalt();
+    const kek = this.cryptoRepository.deriveKek(password, kekSalt);
+    const { wrappedDek, nonce } = this.cryptoRepository.wrapDek(dek, kek);
+
+    await this.userRepository.update(userId, {
+      wrappedDek: wrappedDek.toString('base64'),
+      kekSalt: kekSalt.toString('base64'),
+      kekNonce: nonce.toString('base64'),
+    });
+
+    return dek;
+  }
+
+  /**
+   * Unwraps a user's existing DEK using a KEK derived from the given (already-verified) password.
+   * Throws if the DEK material is missing or if the KEK/password doesn't match what it was wrapped with.
+   */
+  private unwrapUserDek(
+    user: { wrappedDek?: string | null; kekSalt?: string | null; kekNonce?: string | null },
+    password: string,
+  ): Buffer {
+    if (!user.wrappedDek || !user.kekSalt || !user.kekNonce) {
+      throw new Error('Cannot unwrap DEK: user is missing wrapped DEK material');
+    }
+
+    const kek = this.cryptoRepository.deriveKek(password, Buffer.from(user.kekSalt, 'base64'));
+    return this.cryptoRepository.unwrapDek(
+      Buffer.from(user.wrappedDek, 'base64'),
+      Buffer.from(user.kekNonce, 'base64'),
+      kek,
+    );
   }
 
   async logout(auth: AuthDto, authType: AuthType): Promise<LogoutResponseDto> {
@@ -134,7 +196,23 @@ export class AuthService extends BaseService {
 
     const hashedPassword = await this.cryptoRepository.hashBcrypt(newPassword, SALT_ROUNDS);
 
-    const updatedUser = await this.userRepository.update(user.id, { password: hashedPassword });
+    // Re-wrap the DEK under a KEK derived from the new password, using the old (just-verified) password to
+    // unwrap it first — otherwise the DEK becomes permanently unrecoverable as soon as the password changes,
+    // since its old KEK can no longer be re-derived.
+    let dekUpdate: { wrappedDek: string; kekSalt: string; kekNonce: string } | undefined;
+    if (user.wrappedDek) {
+      const dek = this.unwrapUserDek(user, password);
+      const kekSalt = this.cryptoRepository.generateKekSalt();
+      const kek = this.cryptoRepository.deriveKek(newPassword, kekSalt);
+      const { wrappedDek, nonce } = this.cryptoRepository.wrapDek(dek, kek);
+      dekUpdate = {
+        wrappedDek: wrappedDek.toString('base64'),
+        kekSalt: kekSalt.toString('base64'),
+        kekNonce: nonce.toString('base64'),
+      };
+    }
+
+    const updatedUser = await this.userRepository.update(user.id, { password: hashedPassword, ...dekUpdate });
 
     await this.eventRepository.emit('AuthChangePassword', {
       userId: user.id,
@@ -372,7 +450,7 @@ export class AuthService extends BaseService {
       await this.syncProfilePicture(user, profile.picture);
     }
 
-    return this.createLoginResponse(user, loginDetails, oauthSid, oauthBearerToken);
+    return this.createLoginResponse(user, loginDetails, { oauthSid, oauthBearerToken });
   }
 
   private async syncProfilePicture(user: UserAdmin, url: string) {
@@ -545,6 +623,7 @@ export class AuthService extends BaseService {
     const hashed = this.cryptoRepository.hashSha256(token);
     const session = await this.sessionRepository.getByToken(hashed);
     if (session?.user) {
+      // this.logger.debug(`[DEK] Validated session ${session.id} for user ${session.user.id}`);
       const { appVersion, deviceOS, deviceType } = getUserAgentDetails(headers);
       const now = DateTime.now();
       const updatedAt = DateTime.fromJSDate(session.updatedAt);
@@ -573,11 +652,14 @@ export class AuthService extends BaseService {
         }
       }
 
+      // this.logger.debug(`[DEK] Returning AuthDto for session ${session.id} with rawToken length=${token.length}`);
+
       return {
         user: session.user,
         session: {
           id: session.id,
           hasElevatedPermission,
+          rawToken: token,
         },
       };
     }
@@ -609,13 +691,26 @@ export class AuthService extends BaseService {
   private async createLoginResponse(
     user: UserAdmin,
     loginDetails: LoginDetails,
-    oauthSid?: string,
-    oauthBearerToken?: string,
+    options: { oauthSid?: string; oauthBearerToken?: string; dek?: Buffer } = {},
   ) {
+    const { oauthSid, oauthBearerToken, dek } = options;
     const token = this.cryptoRepository.randomBytesAsText(32);
     const hashed = this.cryptoRepository.hashSha256(token);
 
-    await this.sessionRepository.create({
+    let wrappedDek: string | null = null;
+    let dekNonce: string | null = null;
+    if (dek) {
+      const sessionKek = this.cryptoRepository.deriveSessionKek(token);
+      const wrapped = this.cryptoRepository.wrapDek(dek, sessionKek);
+      wrappedDek = wrapped.wrappedDek.toString('base64');
+      dekNonce = wrapped.nonce.toString('base64');
+    }
+
+    this.logger.debug(
+      `[DEK] Creating session for user ${user.id}: dek ${dek ? 'was provided' : 'was NOT provided'}, session-level wrappedDek ${wrappedDek ? 'set' : 'is null'}`,
+    );
+
+    const session = await this.sessionRepository.create({
       token: hashed,
       deviceOS: loginDetails.deviceOS,
       deviceType: loginDetails.deviceType,
@@ -623,7 +718,11 @@ export class AuthService extends BaseService {
       userId: user.id,
       oauthSid: oauthSid ?? null,
       oauthBearerToken: oauthBearerToken ?? null,
+      wrappedDek,
+      dekNonce,
     });
+
+    this.logger.debug(`[DEK] Session ${session.id} created for user ${user.id}`);
 
     return mapLoginResponse(user, token);
   }

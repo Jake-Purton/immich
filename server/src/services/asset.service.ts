@@ -1,6 +1,7 @@
 import { BadRequestException, Injectable } from '@nestjs/common';
 import _ from 'lodash';
 import { DateTime, Duration } from 'luxon';
+import { pipeline } from 'node:stream/promises';
 import { AssetFile } from 'src/database';
 import { OnJob } from 'src/decorators';
 import { AssetResponseDto, SanitizedAssetResponseDto, mapAsset } from 'src/dtos/asset-response.dto';
@@ -174,10 +175,199 @@ export class AssetService extends BaseService {
     }
 
     if (visibility === AssetVisibility.Locked) {
+      this.logger.debug(
+        `[DEK] updateAll locking ${ids.length} asset(s) for user ${auth.user.id}; auth.session=${auth.session ? auth.session.id : 'none'}, rawToken present=${!!auth.session?.rawToken}`,
+      );
       await this.albumRepository.removeAssetsFromAll(ids);
+      await this.encryptLockedAssets(auth, ids);
+    } else if (visibility !== undefined) {
+      this.logger.debug(
+        `[DEK] updateAll changing visibility of ${ids.length} asset(s) to ${visibility} for user ${auth.user.id}; checking for previously-encrypted assets to decrypt`,
+      );
+      await this.decryptUnlockedAssets(auth, ids);
     }
 
     await this.jobRepository.queueAll(ids.map((id) => ({ name: JobName.SidecarWrite, data: { id } })));
+  }
+
+  /**
+   * Encrypts the original file, at rest, for assets newly moved into the Locked Folder. Best-effort: if the
+   * current session has no DEK available (e.g. an OAuth-only user, or a session that predates this feature), the
+   * assets are simply left unencrypted, exactly as Locked Folder behaved before this feature existed — this
+   * never blocks the visibility change itself. Already-encrypted assets (re-locking, duplicate calls) are
+   * skipped.
+   *
+   * Deliberately run synchronously with this request, not as a background job: this is the only place a
+   * plaintext DEK is reliably available for an asset that isn't brand new — see `resolveSessionDek` — a job
+   * processor has no user session to derive one from. By the time an asset is being locked, its thumbnails,
+   * preview, and metadata have normally already been generated while it was a plain Timeline asset, so nothing
+   * else needs to read the now-encrypted original afterwards. See `getForGenerateThumbnailJob`,
+   * `getForMetadataExtraction`, and `getForVideoConversion` guards for what happens if a reprocessing job is
+   * triggered for an asset that got encrypted after those derivatives were already made.
+   */
+  private async encryptLockedAssets(auth: AuthDto, ids: string[]): Promise<void> {
+    const dek = await this.resolveSessionDek(auth);
+    if (!dek) {
+      this.logger.debug('[DEK] Skipping locked-asset encryption: no DEK available for this session');
+      return;
+    }
+
+    this.logger.debug(
+      `[DEK] Resolved session DEK, attempting to encrypt ${ids.length} locked asset(s): ${ids.join(', ')}`,
+    );
+
+    const assets = await this.assetRepository.getByIds(ids);
+    this.logger.debug(
+      `[DEK] Fetched ${assets.length} asset row(s) for encryption out of ${ids.length} requested id(s)`,
+    );
+    for (const asset of assets) {
+      if (asset.encryptionNonce) {
+        this.logger.debug(`[DEK] Asset ${asset.id} is already encrypted (nonce present), skipping`);
+        continue;
+      }
+
+      this.logger.debug(`[DEK] Encrypting asset ${asset.id} at originalPath=${asset.originalPath}`);
+      try {
+        const { nonce, authTag } = await this.encryptOriginalFile(asset.originalPath, dek);
+        await this.assetRepository.update({ id: asset.id, encryptionNonce: nonce, encryptionAuthTag: authTag });
+        this.logger.debug(`[DEK] Successfully encrypted and persisted nonce/authTag for asset ${asset.id}`);
+      } catch (error: any) {
+        this.logger.error(`[DEK] Failed to encrypt locked asset ${asset.id} at rest: ${error}`, error?.stack);
+      }
+
+      const assetFiles = await this.assetFileRepository.search({
+        assetId: asset.id,
+      });
+
+      for (const assetFile of assetFiles) {
+        this.logger.debug(`[DEK]     Encrypting ${assetFile.type} at path=${assetFile.path}`);
+
+        try {
+          const { nonce, authTag } = await this.encryptOriginalFile(assetFile.path, dek);
+          await this.assetFileRepository.update({
+            id: assetFile.id,
+            encryptionNonce: nonce,
+            encryptionAuthTag: authTag,
+          });
+          this.logger.debug(`[DEK]     Successfully encrypted and persisted nonce/authTag for ${assetFile.type}`);
+        } catch (error: any) {
+          this.logger.error(`[DEK]     Failed to encrypt thumbnail: ${error}`, error?.stack);
+        }
+      }
+    }
+  }
+
+  /** Encrypts `originalPath` in place with `dek`, returning the base64 nonce/auth tag needed to decrypt it later. */
+  private async encryptOriginalFile(originalPath: string, dek: Buffer): Promise<{ nonce: string; authTag: string }> {
+    const { nonce, cipher } = this.cryptoRepository.createEncryptStream(dek);
+    const tmpPath = `${originalPath}.encrypting`;
+
+    this.logger.debug(`[DEK] Streaming ${originalPath} -> ${tmpPath} through AES-256-GCM cipher`);
+
+    await pipeline(
+      this.storageRepository.createPlainReadStream(originalPath),
+      cipher,
+      this.storageRepository.createWriteStream(tmpPath),
+    );
+
+    const authTag = cipher.getAuthTag();
+    await this.storageRepository.rename(tmpPath, originalPath);
+
+    this.logger.debug(
+      `[DEK] Encrypted file written and renamed back to ${originalPath} (authTag length=${authTag.length})`,
+    );
+
+    return { nonce: nonce.toString('base64'), authTag: authTag.toString('base64') };
+  }
+
+  /**
+   * Decrypts the original file, at rest, for assets moved out of the Locked Folder (to Timeline, Archive, or
+   * Hidden). Mirrors `encryptLockedAssets`: best-effort, never blocks the visibility change. If the current
+   * session has no DEK available, the asset is left encrypted on disk even though its visibility has changed —
+   * see the design doc's known-limitations section. Assets that aren't currently encrypted are skipped.
+   */
+  private async decryptUnlockedAssets(auth: AuthDto, ids: string[]): Promise<void> {
+    const assets = await this.assetRepository.getByIds(ids);
+    const encryptedAssets = assets.filter((asset) => asset.encryptionNonce);
+    if (encryptedAssets.length === 0) {
+      this.logger.debug('[DEK] No previously-encrypted assets among the ones being unlocked, nothing to decrypt');
+      return;
+    }
+
+    const dek = await this.resolveSessionDek(auth);
+    if (!dek) {
+      this.logger.warn(
+        `[DEK] Cannot decrypt ${encryptedAssets.length} asset(s) being moved out of Locked Folder: no DEK available for this session — file(s) will remain encrypted at rest despite the visibility change`,
+      );
+      return;
+    }
+
+    this.logger.debug(`[DEK] Resolved session DEK, attempting to decrypt ${encryptedAssets.length} unlocked asset(s)`);
+
+    for (const asset of encryptedAssets) {
+      if (!asset.encryptionNonce || !asset.encryptionAuthTag) {
+        continue;
+      }
+
+      this.logger.debug(`[DEK] Decrypting asset ${asset.id} at originalPath=${asset.originalPath}`);
+      try {
+        await this.decryptOriginalFile(
+          asset.originalPath,
+          dek,
+          Buffer.from(asset.encryptionNonce, 'base64'),
+          Buffer.from(asset.encryptionAuthTag, 'base64'),
+        );
+        await this.assetRepository.update({ id: asset.id, encryptionNonce: null, encryptionAuthTag: null });
+        this.logger.debug(`[DEK] Successfully decrypted and cleared nonce/authTag for asset ${asset.id}`);
+      } catch (error: any) {
+        this.logger.error(`[DEK] Failed to decrypt unlocked asset ${asset.id} at rest: ${error}`, error?.stack);
+      }
+
+      const assetFiles = await this.assetFileRepository.search({
+        assetId: asset.id,
+      });
+
+      for (const assetFile of assetFiles) {
+        if (!assetFile.encryptionNonce || !assetFile.encryptionAuthTag) {
+          continue;
+        }
+
+        this.logger.debug(`[DEK]     Decrypting ${assetFile.type} at path=${assetFile.path}`);
+
+        try {
+          await this.decryptOriginalFile(
+            assetFile.path,
+            dek,
+            Buffer.from(assetFile.encryptionNonce, 'base64'),
+            Buffer.from(assetFile.encryptionAuthTag, 'base64'),
+          );
+          await this.assetFileRepository.update({ id: assetFile.id, encryptionNonce: null, encryptionAuthTag: null });
+          this.logger.debug(
+            `[DEK]     Successfully decrypted and cleared nonce/authTag for assetFile: ${assetFile.type}`,
+          );
+        } catch (error: any) {
+          this.logger.error(`[DEK]     Failed to decrypt unlocked asset ${asset.id} at rest: ${error}`, error?.stack);
+        }
+      }
+    }
+  }
+
+  /** Decrypts `originalPath` in place with `dek`/`nonce`/`authTag`, the inverse of `encryptOriginalFile`. */
+  private async decryptOriginalFile(originalPath: string, dek: Buffer, nonce: Buffer, authTag: Buffer): Promise<void> {
+    const decipher = this.cryptoRepository.createDecryptStream(dek, nonce, authTag);
+    const tmpPath = `${originalPath}.decrypting`;
+
+    this.logger.debug(`[DEK] Streaming ${originalPath} -> ${tmpPath} through AES-256-GCM decipher`);
+
+    await pipeline(
+      this.storageRepository.createPlainReadStream(originalPath),
+      decipher,
+      this.storageRepository.createWriteStream(tmpPath),
+    );
+
+    await this.storageRepository.rename(tmpPath, originalPath);
+
+    this.logger.debug(`[DEK] Decrypted file written and renamed back to ${originalPath}`);
   }
 
   async copy(
