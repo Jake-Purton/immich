@@ -27,6 +27,11 @@ server-only change: no web/mobile app modifications are required, and no API con
   access to the session's DEK. Background jobs (thumbnail generation, metadata extraction, transcoding, ML) never
   touch ciphertext — they either already produced their derivatives before the asset was locked, or they detect
   the asset is encrypted and skip re-processing it.
+- **Retroactive migration** — assets that were already in the Locked Folder before this feature was installed,
+  or that got locked during a session with no DEK available at the time, aren't left unencrypted forever: the
+  next time that user logs in with their password (and a DEK becomes available), the server automatically finds
+  and encrypts any of their own Locked assets that are still missing encryption metadata. No separate action is
+  needed beyond a normal password login.
 - **Decryption** — happens on demand, per request, for original downloads, thumbnails, video playback (including
   HTTP Range/seek support), and bulk zip downloads — provided the requesting session has a resolvable DEK. If it
   doesn't, the server refuses to serve raw ciphertext as if it were a normal file; it returns an error instead of
@@ -38,10 +43,8 @@ For the full design rationale, data model, and known limitations, see
 ## Known limitations
 
 - **OAuth-only accounts** (no password ever set) currently can't get a DEK at all, so their Locked Folder assets
-  stay unencrypted — same as today's behavior, not a regression, but not yet solved either.
-- **Assets already in the Locked Folder before upgrading**, or assets locked while no session DEK was available,
-  are not retroactively encrypted. There's no background migration; encryption only happens going forward, on
-  sessions that have password-derived key material available.
+  stay unencrypted — same as today's behavior, not a regression, but not yet solved either. This also means the
+  retroactive migration below doesn't apply to them, since it's triggered by a password login.
 - **Scrubbing/seeking in encrypted videos re-decrypts the whole file per seek** (AES-GCM's auth tag covers the
   entire file, so partial/random-access decryption isn't possible without a different on-disk format). This is a
   real CPU cost for large videos, not just a theoretical one.
@@ -72,7 +75,8 @@ setup — no config, environment variable, or client changes required.
 3. Restart the stack (`docker compose up -d`). Existing data, sessions, and settings are unaffected — the new
    `wrappedDek`/`kekSalt`/`kekNonce`/encryption-related columns are added via normal migrations
 
-4. Log out and log back in to generate a DEK
+4. Log out and log back in to generate a DEK — this also automatically encrypts any of your own assets that are
+   already in the Locked Folder but not yet encrypted (e.g. from before you switched to this image)
 
 5. Move a file into the locked folder (or out of, and then back into) to encrypt
 

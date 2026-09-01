@@ -23,6 +23,7 @@ import {
 import { UserAdminResponseDto, mapUserAdmin } from 'src/dtos/user.dto';
 import { AuthType, ImmichCookie, ImmichHeader, ImmichQuery, JobName, Permission } from 'src/enum';
 import { OAuthProfile } from 'src/repositories/oauth.repository';
+import { AssetService } from 'src/services/asset.service';
 import { BaseService } from 'src/services/base.service';
 import { isGranted } from 'src/utils/access';
 import { HumanReadableSize } from 'src/utils/bytes';
@@ -93,7 +94,20 @@ export class AuthService extends BaseService {
       `[DEK] Login for user ${user.id} completed with dek=${dek ? `present (length=${dek.length})` : 'MISSING'}`,
     );
 
+    if (dek) {
+      await this.encryptPreexistingLockedAssets(user.id, dek);
+    }
+
     return this.createLoginResponse(user, details, { dek });
+  }
+
+  private async encryptPreexistingLockedAssets(userId: string, dek: Buffer): Promise<void> {
+    try {
+      const assetService = BaseService.create(AssetService, this);
+      await assetService.encryptUnencryptedLockedAssetsForUser(userId, dek);
+    } catch (error: any) {
+      this.logger.error(`[DEK] Failed to migrate pre-existing locked assets for user ${userId}: ${error}`, error?.stack);
+    }
   }
 
   /**

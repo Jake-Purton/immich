@@ -155,6 +155,23 @@ describe(AuthService.name, () => {
       );
     });
 
+    it('should migrate previously-locked unencrypted assets when a DEK is available', async () => {
+      const user = UserFactory.create({
+        password: 'immich_password',
+        wrappedDek: 'existing-wrapped-dek',
+        kekSalt: 'existing-kek-salt',
+        kekNonce: 'existing-kek-nonce',
+      });
+      const session = SessionFactory.create();
+      mocks.user.getByEmail.mockResolvedValue(user);
+      mocks.session.create.mockResolvedValue(session);
+      mocks.asset.getUnencryptedLockedIdsByUserId.mockResolvedValue([]);
+
+      await sut.login(dto, loginDetails);
+
+      expect(mocks.asset.getUnencryptedLockedIdsByUserId).toHaveBeenCalledWith(user.id);
+    });
+
     it('should not fail login if the existing DEK cannot be unwrapped', async () => {
       const user = UserFactory.create({
         password: 'immich_password',
@@ -174,6 +191,7 @@ describe(AuthService.name, () => {
       // no session-level DEK should be cached in this case, but login itself must still succeed
       expect(mocks.crypto.deriveSessionKek).not.toHaveBeenCalled();
       expect(mocks.session.create).toHaveBeenCalledWith(expect.objectContaining({ wrappedDek: null, dekNonce: null }));
+      expect(mocks.asset.getUnencryptedLockedIdsByUserId).not.toHaveBeenCalled();
     });
   });
 
