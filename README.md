@@ -78,7 +78,7 @@ setup — no config, environment variable, or client changes required.
 4. Log out and log back in to generate a DEK — this also automatically encrypts any of your own assets that are
    already in the Locked Folder but not yet encrypted (e.g. from before you switched to this image)
 
-5. Move a file into the locked folder (or out of, and then back into) to encrypt
+5. Move a file into the locked folder to encrypt
 
 ## ⚠️ Disclaimer
 
