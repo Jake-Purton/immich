@@ -6,6 +6,10 @@ source /immich-devcontainer/container-common.sh
 log "Preparing Immich Nest API Server"
 log ""
 export CI=1
+run_cmd pnpm --filter @immich/sdk install
+run_cmd pnpm --filter @immich/sdk build
+run_cmd pnpm --filter @immich/plugin-sdk install
+run_cmd pnpm --filter @immich/plugin-sdk build
 run_cmd pnpm --filter immich install
 
 log "Starting Nest API Server"
