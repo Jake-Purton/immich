@@ -513,6 +513,19 @@ export class AssetRepository {
     return this.db.selectFrom('asset').selectAll('asset').where('asset.id', '=', anyUuid(ids)).execute();
   }
 
+  async getUnencryptedLockedIdsByUserId(ownerId: string): Promise<string[]> {
+    const rows = await this.db
+      .selectFrom('asset')
+      .select('id')
+      .where('ownerId', '=', asUuid(ownerId))
+      .where('visibility', '=', AssetVisibility.Locked)
+      .where('encryptionNonce', 'is', null)
+      .where('deletedAt', 'is', null)
+      .execute();
+
+    return rows.map(({ id }) => id);
+  }
+
   @GenerateSql({ params: [[DummyValue.UUID]] })
   @ChunkedArray({ paramIndex: 0 })
   getByIdsWithAllRelationsButStacks(ids: string[], viewingUserId?: string) {

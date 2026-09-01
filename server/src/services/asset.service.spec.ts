@@ -543,6 +543,43 @@ describe(AssetService.name, () => {
         expect(mocks.storage.createPlainReadStream).not.toHaveBeenCalled();
         expect(mocks.asset.update).not.toHaveBeenCalled();
       });
+
+      it('should encrypt previously-locked unencrypted assets when migrating by user id', async () => {
+        const asset = AssetFactory.create({ originalPath: '/data/library/photo.jpg', encryptionNonce: null });
+        mocks.asset.getUnencryptedLockedIdsByUserId.mockResolvedValue([asset.id]);
+        mocks.asset.getByIds.mockResolvedValue([asset]);
+        mocks.assetFile.search.mockResolvedValue([]);
+
+        const cipher = new PassThrough() as unknown as CipherGCM;
+        cipher.getAuthTag = () => Buffer.from('auth-tag', 'utf8');
+        mocks.crypto.createEncryptStream.mockReturnValue({ nonce: Buffer.from('nonce', 'utf8'), cipher });
+        mocks.storage.createPlainReadStream.mockReturnValue(Readable.from([Buffer.from('plaintext')]));
+        mocks.storage.createWriteStream.mockReturnValue(
+          new Writable({
+            write(_chunk, _encoding, callback) {
+              callback();
+            },
+          }),
+        );
+
+        await sut.encryptUnencryptedLockedAssetsForUser('user-id', Buffer.from('dek', 'utf8'));
+
+        expect(mocks.asset.getUnencryptedLockedIdsByUserId).toHaveBeenCalledWith('user-id');
+        expect(mocks.asset.update).toHaveBeenCalledWith({
+          id: asset.id,
+          encryptionNonce: Buffer.from('nonce', 'utf8').toString('base64'),
+          encryptionAuthTag: Buffer.from('auth-tag', 'utf8').toString('base64'),
+        });
+      });
+
+      it('should skip migration when there are no previously-locked unencrypted assets', async () => {
+        mocks.asset.getUnencryptedLockedIdsByUserId.mockResolvedValue([]);
+
+        await sut.encryptUnencryptedLockedAssetsForUser('user-id', Buffer.from('dek', 'utf8'));
+
+        expect(mocks.asset.getByIds).not.toHaveBeenCalled();
+        expect(mocks.asset.update).not.toHaveBeenCalled();
+      });
     });
 
     describe('locked folder decryption', () => {

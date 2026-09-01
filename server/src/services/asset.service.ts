@@ -212,9 +212,22 @@ export class AssetService extends BaseService {
       return;
     }
 
-    this.logger.debug(
-      `[DEK] Resolved session DEK, attempting to encrypt ${ids.length} locked asset(s): ${ids.join(', ')}`,
-    );
+    await this.encryptLockedAssetsWithDek(ids, dek);
+  }
+
+  async encryptUnencryptedLockedAssetsForUser(userId: string, dek: Buffer): Promise<void> {
+    const ids = await this.assetRepository.getUnencryptedLockedIdsByUserId(userId);
+    if (ids.length === 0) {
+      this.logger.debug(`[DEK] No previously-locked unencrypted assets to migrate for user ${userId}`);
+      return;
+    }
+
+    this.logger.debug(`[DEK] Found ${ids.length} previously-locked unencrypted asset(s) to migrate for user ${userId}`);
+    await this.encryptLockedAssetsWithDek(ids, dek);
+  }
+
+  private async encryptLockedAssetsWithDek(ids: string[], dek: Buffer): Promise<void> {
+    this.logger.debug(`[DEK] Using available DEK to encrypt ${ids.length} locked asset(s): ${ids.join(', ')}`);
 
     const assets = await this.assetRepository.getByIds(ids);
     this.logger.debug(
