@@ -1,31 +1,16 @@
-name: Report an issue with Immich
-description: Report an issue with Immich
+name: Report an issue with Jake-Purton/Immich
+description: issue
 body:
-  - type: checkboxes
-    attributes:
-      label: I have searched the existing issues, both open and closed, to make sure this is not a duplicate report.
-      options:
-        - label: 'Yes'
-
-  - type: markdown
-    attributes:
-      value: |
-        This issue form is for reporting bugs only!
-
-        If you have a feature or enhancement request, please use the [feature request][fr] section of our [GitHub Discussions][fr].
-
-        [fr]: https://github.com/immich-app/immich/discussions/new?category=feature-request
-
   - type: textarea
     validations:
       required: true
-    attributes:
-      label: The bug
-      description: >-
-        Describe the issue you are experiencing here, to communicate to the
-        maintainers. Tell us what you were trying to do and what happened.
 
-        Provide a clear and concise description of what the problem is.
+    attributes:
+      label: The bug / feature
+      description: >-
+        Provide a clear and concise description of what the problem or feature is.
+        Ensure that the issue is with the server container, and with this particular fork.
+        Otherwise try https://github.com/immich-app/immich/
 
   - type: markdown
     attributes:
@@ -45,29 +30,7 @@ body:
       required: true
     attributes:
       label: Version of Immich Server
-      placeholder: v1.0.0
-
-  - type: input
-    validations:
-      required: true
-    attributes:
-      label: Version of Immich Mobile App
-      placeholder: v1.0.0
-
-  - type: checkboxes
-    validations:
-      required: true
-    attributes:
-      label: Platform with the issue
-      options:
-        - label: Server
-        - label: Web
-        - label: Mobile
-
-  - type: input
-    attributes:
-      label: Device make and model
-      placeholder: Samsung S25 Android 16
+      placeholder: ghcr.io/jake-purton/immich-server:commit-5366664
 
   - type: textarea
     validations:
@@ -87,7 +50,7 @@ body:
   - type: textarea
     id: repro
     attributes:
-      label: Reproduction steps
+      label: Reproduction steps in the case of bugs
       description: 'How do you trigger this bug? Please walk us through it step by step.'
       value: |
         1.
@@ -95,7 +58,7 @@ body:
         3.
         ...
     validations:
-      required: true
+      required: false
 
   - type: textarea
     id: logs
