@@ -19,7 +19,7 @@ body:
 
   - type: input
     validations:
-      required: true
+      required: false
     attributes:
       label: The OS that Immich Server is running on
       placeholder: Ubuntu 22.10, Debian, Arch...etc
@@ -34,14 +34,14 @@ body:
 
   - type: textarea
     validations:
-      required: true
+      required: false
     attributes:
       label: Your docker-compose.yml content
       render: YAML
 
   - type: textarea
     validations:
-      required: true
+      required: false
     attributes:
       label: Your .env content
       description: Please provide the redacted .env content of your setup
