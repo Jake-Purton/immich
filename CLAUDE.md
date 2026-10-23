@@ -38,6 +38,15 @@ Notes:
 - All of the above require a real reachable Postgres instance except unit tests (`pnpm run test`), which are fully mocked and don't need a DB.
 - If a `pnpm run <script>` command also doesn't work, that's a real signal to stop and report it rather than assuming success — don't claim validation passed without having actually seen it pass.
 
+## Fork branch workflow (syncing upstream releases)
+
+This repo is a fork (`origin` = `Jake-Purton/immich`). `main` tracks upstream immich releases plus fork features; `production` is what gets deployed and should only ever fast-forward to `main`.
+
+1. Add upstream as a remote (once): `git remote add upstream https://github.com/immich-app/immich.git`
+2. For each release, merge the tag into `main` as a **real merge**: `git fetch upstream --tags && git checkout main && git merge v3.x.y`. Never paste upstream changes in as a single squashed/non-merge commit — upstream cuts releases from separate release branches, so a squashed copy loses the history link and causes every version-bump file to conflict on the next upgrade.
+3. Do fork feature work on branches off `main`.
+4. Update production with `git checkout production && git merge --ff-only main`. If `--ff-only` refuses, `production` has drifted and should be sorted out before deploying.
+
 ## Active feature work
 
 See `.claude/encrypted-locked-folder.md` for design notes and progress on making Immich's existing "Locked Folder" feature (asset visibility flag + PIN-code session unlock) actually encrypt assets at rest, via a per-user envelope-encrypted data key.
