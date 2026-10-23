@@ -1,11 +1,10 @@
 import { Injectable } from '@nestjs/common';
-import { Kysely, Updateable } from 'kysely';
-import { isEmpty, isUndefined, omitBy } from 'lodash';
 import { InjectKysely } from 'nestjs-kysely';
-import { AssetFileSearchDto } from 'src/dtos/asset-file.dto';
-import { DB } from 'src/schema';
-import { AssetFileTable } from 'src/schema/tables/asset-file.table';
-import { asUuid } from 'src/utils/database';
+import type { Kysely, Updateable } from 'kysely';
+import { AssetFileSearchDto } from 'src/dtos/asset-file.dto.js';
+import { DB } from 'src/schema/index.js';
+import type { AssetFileTable } from 'src/schema/tables/asset-file.table.js';
+import { asUuid } from 'src/utils/database.js';
 
 @Injectable()
 export class AssetFileRepository {
@@ -33,11 +32,10 @@ export class AssetFileRepository {
   }
 
   async update(assetFile: Updateable<AssetFileTable> & { id: string }) {
-    const value = omitBy(assetFile, isUndefined);
-    delete value.id;
+    const { id, ...value } = assetFile;
 
-    if (!isEmpty(value)) {
-      await this.db.updateTable('asset_file').set(assetFile).where('id', '=', asUuid(assetFile.id)).execute();
+    if (Object.values(value).some((item) => item !== undefined)) {
+      await this.db.updateTable('asset_file').set(value).where('id', '=', asUuid(id)).execute();
       return;
     }
   }
