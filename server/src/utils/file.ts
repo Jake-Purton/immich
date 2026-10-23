@@ -1,4 +1,4 @@
-import { HttpException, NotFoundException, StreamableFile } from '@nestjs/common';
+import { NotFoundException, StreamableFile } from '@nestjs/common';
 import { NextFunction, Response } from 'express';
 import { createReadStream } from 'node:fs';
 import { access, constants, stat } from 'node:fs/promises';
@@ -6,10 +6,10 @@ import { basename, extname } from 'node:path';
 import { Readable, Transform, TransformCallback } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { promisify } from 'node:util';
-import { CacheControl } from 'src/enum';
-import { LoggingRepository } from 'src/repositories/logging.repository';
-import { ImmichReadStream } from 'src/repositories/storage.repository';
-import { isConnectionAborted } from 'src/utils/misc';
+import { CacheControl } from 'src/enum.js';
+import { LoggingRepository } from 'src/repositories/logging.repository.js';
+import { ImmichReadStream } from 'src/repositories/storage.repository.js';
+import { onRouteError } from 'src/utils/logger.js';
 
 export function getFileNameWithoutExtension(path: string): string {
   return basename(path, getFilenameExtension(path));
@@ -171,7 +171,7 @@ export const sendFile = async (
     const cacheControlHeader = cacheControlHeaders[file.cacheControl];
     if (cacheControlHeader) {
       // set the header to Cache-Control
-      res.set('Cache-Control', cacheControlHeader);
+      res.header('Cache-Control', cacheControlHeader);
     }
 
     res.header('Content-Type', file.contentType);
@@ -186,17 +186,10 @@ export const sendFile = async (
 
     return await _sendFile(file.path, { dotfiles: 'allow' });
   } catch (error: Error | any) {
-    // ignore client-closed connection
-    if (isConnectionAborted(error) || res.headersSent) {
-      return;
+    const { canWrite } = onRouteError(undefined, res, error, logger);
+    if (canWrite) {
+      next(new NotFoundException());
     }
-
-    // log non-http errors
-    if (!(error instanceof HttpException)) {
-      logger.error(`Unable to send file: ${error}`, error.stack);
-    }
-
-    next(new NotFoundException());
   }
 };
 
